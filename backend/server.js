@@ -756,7 +756,210 @@ app.post('/api/versions/:versionId/column', (req, res) => {
 });
 
 
+// 保存当前版本的修改为新版本
+app.post('/api/versions/:versionId/save-new-version', (req, res) => {
+    const { versionId } = req.params;
+    const { submitter, changeDescription } = req.body;
+
+    // 首先获取当前版本信息
+    db.get(
+        `SELECT fv.*, f.id as file_id, f.original_name
+         FROM file_versions fv
+         JOIN files f ON fv.file_id = f.id
+         WHERE fv.id = ?`,
+        [versionId],
+        (err, currentVersion) => {
+            if (err) {
+                console.error(err);
+                return res.status(500).json({ error: '获取版本信息失败' });
+            }
+
+            if (!currentVersion) {
+                return res.status(404).json({ error: '版本不存在' });
+            }
+
+            // 获取该文件的最新版本号
+            db.get(
+                'SELECT MAX(version) as max_version FROM file_versions WHERE file_id = ?',
+                [currentVersion.file_id],
+                (err, row) => {
+                    if (err) {
+                        console.error(err);
+                        return res.status(500).json({ error: '获取版本信息失败' });
+                    }
+
+                    const newVersion = (row.max_version || 0) + 1;
+                    const newVersionId = uuidv4();
+
+                    // 创建新版本记录
+                    db.run(
+                        `INSERT INTO file_versions (id, file_id, version, filename, file_path, submitter, change_description, file_size, created_at)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+                        [newVersionId, currentVersion.file_id, newVersion, currentVersion.filename, currentVersion.file_path, submitter, changeDescription, currentVersion.file_size],
+                        function(err) {
+                            if (err) {
+                                console.error(err);
+                                return res.status(500).json({ error: '创建新版本失败' });
+                            }
+
+                            // 复制当前版本的所有数据到新版本
+                            db.all(
+                                'SELECT row_index, column_name, cell_value, cell_type FROM table_data WHERE version_id = ?',
+                                [versionId],
+                                (err, tableData) => {
+                                    if (err) {
+                                        console.error(err);
+                                        return res.status(500).json({ error: '获取表格数据失败' });
+                                    }
+
+                                    // 批量插入新版本的数据
+                                    const stmt = db.prepare(`
+                                        INSERT INTO table_data (id, version_id, row_index, column_name, cell_value, cell_type)
+                                        VALUES (?, ?, ?, ?, ?, ?)
+                                    `);
+
+                                    tableData.forEach(row => {
+                                        const cellId = uuidv4();
+                                        stmt.run([cellId, newVersionId, row.row_index, row.column_name, row.cell_value, row.cell_type]);
+                                    });
+
+                                    stmt.finalize();
+
+                                    // 复制批注数据
+                                    db.all(
+                                        'SELECT row_index, column_name, annotation_type, annotation_data, created_by FROM annotations WHERE version_id = ?',
+                                        [versionId],
+                                        (err, annotations) => {
+                                            if (err) {
+                                                console.error(err);
+                                                // 即使批注复制失败，也返回成功，因为主要数据已经保存
+                                            } else {
+                                                const annotationStmt = db.prepare(`
+                                                    INSERT INTO annotations (id, version_id, row_index, column_name, annotation_type, annotation_data, created_by, created_at)
+                                                    VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                                                `);
+
+                                                annotations.forEach(annotation => {
+                                                    const annotationId = uuidv4();
+                                                    annotationStmt.run([annotationId, newVersionId, annotation.row_index, annotation.column_name, annotation.annotation_type, annotation.annotation_data, annotation.created_by]);
+                                                });
+
+                                                annotationStmt.finalize();
+                                            }
+
+                                            // 更新文件的最后修改时间
+                                            db.run(
+                                                'UPDATE files SET updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+                                                [currentVersion.file_id]
+                                            );
+
+                                            res.json({
+                                                success: true,
+                                                versionId: newVersionId,
+                                                version: newVersion,
+                                                fileId: currentVersion.file_id,
+                                                message: `已保存为新版本 v${newVersion}`
+                                            });
+                                        }
+                                    );
+                                }
+                            );
+                        }
+                    );
+                }
+            );
+        }
+    );
+});
+
 // 启动服务器
 app.listen(PORT, () => {
     console.log(`服务器运行在端口 ${PORT}`);
+});
+
+
+// 版本比较API
+app.get('/api/versions/compare/:version1/:version2', (req, res) => {
+    const { version1, version2 } = req.params;
+    
+    // 获取两个版本的数据
+    const getVersionData = (versionId) => {
+        return new Promise((resolve, reject) => {
+            db.all(
+                'SELECT row_index, column_name, cell_value, cell_type FROM table_data WHERE version_id = ? ORDER BY row_index, column_name',
+                [versionId],
+                (err, rows) => {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        const dataMap = {};
+                        rows.forEach(row => {
+                            const key = `${row.row_index}-${row.column_name}`;
+                            dataMap[key] = {
+                                value: row.cell_value,
+                                type: row.cell_type,
+                                rowIndex: row.row_index,
+                                columnName: row.column_name
+                            };
+                        });
+                        resolve(dataMap);
+                    }
+                }
+            );
+        });
+    };
+    
+    Promise.all([getVersionData(version1), getVersionData(version2)])
+        .then(([data1, data2]) => {
+            const changes = [];
+            const allKeys = new Set([...Object.keys(data1), ...Object.keys(data2)]);
+            
+            allKeys.forEach(key => {
+                const cell1 = data1[key];
+                const cell2 = data2[key];
+                
+                if (!cell1 && cell2) {
+                    // 新增的单元格
+                    changes.push({
+                        rowIndex: cell2.rowIndex,
+                        columnName: cell2.columnName,
+                        changeType: 'added',
+                        oldValue: '',
+                        newValue: cell2.value,
+                        position: key
+                    });
+                } else if (cell1 && !cell2) {
+                    // 删除的单元格
+                    changes.push({
+                        rowIndex: cell1.rowIndex,
+                        columnName: cell1.columnName,
+                        changeType: 'deleted',
+                        oldValue: cell1.value,
+                        newValue: '',
+                        position: key
+                    });
+                } else if (cell1 && cell2 && cell1.value !== cell2.value) {
+                    // 修改的单元格
+                    changes.push({
+                        rowIndex: cell1.rowIndex,
+                        columnName: cell1.columnName,
+                        changeType: 'modified',
+                        oldValue: cell1.value,
+                        newValue: cell2.value,
+                        position: key
+                    });
+                }
+            });
+            
+            res.json({
+                success: true,
+                changes: changes,
+                version1,
+                version2
+            });
+        })
+        .catch(err => {
+            console.error('版本比较失败:', err);
+            res.status(500).json({ error: '版本比较失败' });
+        });
 });
