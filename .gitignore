@@ -1,13 +1,22 @@
 # Dependencies
 node_modules/
+/frontend/node_modules/
+/backend/node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
-package-lock.json
+
+# Lock files (保留package-lock.json用于版本锁定)
+# package-lock.json  # 建议注释掉这行，保留lock文件
+yarn.lock
 
 # Production builds
 /frontend/build/
 /frontend/dist/
+/backend/build/
+/backend/dist/
+build/
+dist/
 
 # Environment variables
 .env
@@ -15,15 +24,25 @@ package-lock.json
 .env.development.local
 .env.test.local
 .env.production.local
+.env.*.local
 
 # Database files
 *.db
 *.db-shm
 *.db-wal
+*.sqlite
+*.sqlite3
 /backend/excel_system.db*
+/backend/database/
 
-# Uploaded files
+# Uploaded files and user data
 /backend/uploads/
+/uploads/
+*.xlsx
+*.xls
+*.csv
+/backend/files/
+/files/
 
 # IDE files
 .vscode/
@@ -31,6 +50,9 @@ package-lock.json
 *.swp
 *.swo
 *~
+.project
+.classpath
+.settings/
 
 # OS generated files
 .DS_Store
@@ -40,10 +62,15 @@ package-lock.json
 .Trashes
 ehthumbs.db
 Thumbs.db
+Desktop.ini
 
 # Logs
 logs/
 *.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
 
 # Runtime data
 pids/
@@ -53,7 +80,57 @@ pids/
 
 # Coverage directory used by tools like istanbul
 coverage/
+*.lcov
+.nyc_output
 
 # Temporary folders
 tmp/
 temp/
+.tmp/
+.temp/
+
+# Cache directories
+.cache/
+.parcel-cache/
+.next/
+.nuxt/
+.vuepress/dist
+
+# Dependency directories
+jspm_packages/
+
+# Optional npm cache directory
+.npm
+
+# Optional eslint cache
+.eslintcache
+
+# Microbundle cache
+.rpt2_cache/
+.rts2_cache_cjs/
+.rts2_cache_es/
+.rts2_cache_umd/
+
+# Optional REPL history
+.node_repl_history
+
+# Output of 'npm pack'
+*.tgz
+
+# Yarn Integrity file
+.yarn-integrity
+
+# dotenv environment variables file
+.env.test
+
+# Stores VSCode versions used for testing VSCode extensions
+.vscode-test
+
+# Backup files
+*.bak
+*.backup
+*.old
+
+# System files
+*.tmp
+*.temp
