@@ -139,53 +139,66 @@ const db = new sqlite3.Database('./excel_system.db', (err) => {
 
 // 创建表
 db.serialize(() => {
-    // 文件版本表
+    // 文件主表 - 管理不同的文件
+    db.run(`CREATE TABLE IF NOT EXISTS files (
+        id TEXT PRIMARY KEY,
+        original_name TEXT NOT NULL,
+        file_hash TEXT,
+        created_by TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(original_name)
+    )`);
+
+    // 文件版本表 - 每个文件的不同版本
     db.run(`CREATE TABLE IF NOT EXISTS file_versions (
         id TEXT PRIMARY KEY,
-        filename TEXT NOT NULL,
-        original_name TEXT NOT NULL,
-        file_path TEXT NOT NULL,
+        file_id TEXT NOT NULL,
         version INTEGER NOT NULL,
+        filename TEXT NOT NULL,
+        file_path TEXT NOT NULL,
         submitter TEXT NOT NULL,
         change_description TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        file_size INTEGER,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (file_id) REFERENCES files (id),
+        UNIQUE(file_id, version)
     )`);
 
     // 表格数据表
     db.run(`CREATE TABLE IF NOT EXISTS table_data (
         id TEXT PRIMARY KEY,
-        file_version_id TEXT NOT NULL,
+        version_id TEXT NOT NULL,
         row_index INTEGER NOT NULL,
         column_name TEXT NOT NULL,
         cell_value TEXT,
         cell_type TEXT DEFAULT 'text',
-        annotations TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (file_version_id) REFERENCES file_versions (id)
+        FOREIGN KEY (version_id) REFERENCES file_versions (id)
     )`);
 
     // 批注表
     db.run(`CREATE TABLE IF NOT EXISTS annotations (
         id TEXT PRIMARY KEY,
-        file_version_id TEXT NOT NULL,
+        version_id TEXT NOT NULL,
         row_index INTEGER NOT NULL,
         column_name TEXT NOT NULL,
         annotation_type TEXT NOT NULL,
         annotation_data TEXT,
         created_by TEXT NOT NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (file_version_id) REFERENCES file_versions (id)
+        FOREIGN KEY (version_id) REFERENCES file_versions (id)
     )`);
 
     // 自定义列表
     db.run(`CREATE TABLE IF NOT EXISTS custom_columns (
         id TEXT PRIMARY KEY,
-        file_version_id TEXT NOT NULL,
+        version_id TEXT NOT NULL,
         column_name TEXT NOT NULL,
         column_type TEXT DEFAULT 'text',
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (file_version_id) REFERENCES file_versions (id)
+        FOREIGN KEY (version_id) REFERENCES file_versions (id)
     )`);
 });
 
@@ -240,6 +253,17 @@ function renderMarkdownTable(content) {
 // API路由
 
 // 上传Excel文件
+const crypto = require('crypto');
+
+// 计算文件哈希
+function calculateFileHash(filePath) {
+    const fileBuffer = fs.readFileSync(filePath);
+    const hashSum = crypto.createHash('md5');
+    hashSum.update(fileBuffer);
+    return hashSum.digest('hex');
+}
+
+// 上传Excel文件
 app.post('/api/upload', upload.single('file'), (req, res) => {
     try {
         const { submitter, changeDescription } = req.body;
@@ -249,60 +273,106 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
             return res.status(400).json({ error: '没有上传文件' });
         }
 
-        const fileId = uuidv4();
         const { headers, data } = parseExcelFile(file.path);
+        const fileHash = calculateFileHash(file.path);
+        const originalName = file.originalname;
 
-        // 获取当前文件的最新版本号
+        // 首先检查文件是否已存在
         db.get(
-            'SELECT MAX(version) as max_version FROM file_versions WHERE original_name = ?',
-            [file.originalname],
-            (err, row) => {
+            'SELECT id FROM files WHERE original_name = ?',
+            [originalName],
+            (err, existingFile) => {
                 if (err) {
                     console.error(err);
                     return res.status(500).json({ error: '数据库错误' });
                 }
 
-                const version = (row.max_version || 0) + 1;
+                let fileId;
+                
+                const processFileVersion = (fileId) => {
+                    // 获取该文件的最新版本号
+                    db.get(
+                        'SELECT MAX(version) as max_version FROM file_versions WHERE file_id = ?',
+                        [fileId],
+                        (err, row) => {
+                            if (err) {
+                                console.error(err);
+                                return res.status(500).json({ error: '获取版本信息失败' });
+                            }
 
-                // 插入文件版本记录
-                db.run(
-                    `INSERT INTO file_versions (id, filename, original_name, file_path, version, submitter, change_description)
-                     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-                    [fileId, file.filename, file.originalname, file.path, version, submitter, changeDescription],
-                    function(err) {
-                        if (err) {
-                            console.error(err);
-                            return res.status(500).json({ error: '保存文件信息失败' });
+                            const version = (row.max_version || 0) + 1;
+                            const versionId = uuidv4();
+
+                            // 插入新版本记录
+                            db.run(
+                                `INSERT INTO file_versions (id, file_id, version, filename, file_path, submitter, change_description, file_size)
+                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                                [versionId, fileId, version, file.filename, file.path, submitter, changeDescription, file.size],
+                                function(err) {
+                                    if (err) {
+                                        console.error(err);
+                                        return res.status(500).json({ error: '保存版本信息失败' });
+                                    }
+
+                                    // 插入表格数据
+                                    const stmt = db.prepare(`
+                                        INSERT INTO table_data (id, version_id, row_index, column_name, cell_value, cell_type)
+                                        VALUES (?, ?, ?, ?, ?, ?)
+                                    `);
+
+                                    data.forEach((row, rowIndex) => {
+                                        headers.forEach(header => {
+                                            const cellId = uuidv4();
+                                            const cellValue = row[header];
+                                            const cellType = typeof cellValue === 'number' ? 'number' : 'text';
+                                            
+                                            stmt.run([cellId, versionId, rowIndex, header, cellValue, cellType]);
+                                        });
+                                    });
+
+                                    stmt.finalize();
+
+                                    // 更新文件的最后修改时间
+                                    db.run(
+                                        'UPDATE files SET updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+                                        [fileId]
+                                    );
+
+                                    res.json({
+                                        success: true,
+                                        fileId,
+                                        versionId,
+                                        version,
+                                        headers,
+                                        dataCount: data.length,
+                                        message: `文件 "${originalName}" 的第 ${version} 版本上传成功`
+                                    });
+                                }
+                            );
                         }
+                    );
+                };
 
-                        // 插入表格数据
-                        const stmt = db.prepare(`
-                            INSERT INTO table_data (id, file_version_id, row_index, column_name, cell_value, cell_type)
-                            VALUES (?, ?, ?, ?, ?, ?)
-                        `);
-
-                        data.forEach((row, rowIndex) => {
-                            headers.forEach(header => {
-                                const cellId = uuidv4();
-                                const cellValue = row[header];
-                                const cellType = typeof cellValue === 'number' ? 'number' : 'text';
-                                
-                                stmt.run([cellId, fileId, rowIndex, header, cellValue, cellType]);
-                            });
-                        });
-
-                        stmt.finalize();
-
-                        res.json({
-                            success: true,
-                            fileId,
-                            version,
-                            headers,
-                            dataCount: data.length,
-                            message: '文件上传成功'
-                        });
-                    }
-                );
+                if (existingFile) {
+                    // 文件已存在，添加新版本
+                    fileId = existingFile.id;
+                    processFileVersion(fileId);
+                } else {
+                    // 新文件，创建文件记录
+                    fileId = uuidv4();
+                    db.run(
+                        `INSERT INTO files (id, original_name, file_hash, created_by)
+                         VALUES (?, ?, ?, ?)`,
+                        [fileId, originalName, fileHash, submitter],
+                        function(err) {
+                            if (err) {
+                                console.error(err);
+                                return res.status(500).json({ error: '创建文件记录失败' });
+                            }
+                            processFileVersion(fileId);
+                        }
+                    );
+                }
             }
         );
     } catch (error) {
@@ -310,17 +380,48 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
         res.status(500).json({ error: '文件处理失败' });
     }
 });
-
-// 获取文件版本列表
+// 获取所有文件列表
 app.get('/api/files', (req, res) => {
+    const query = `
+        SELECT 
+            f.id,
+            f.original_name,
+            f.created_by,
+            f.created_at,
+            f.updated_at,
+            COUNT(fv.id) as version_count,
+            MAX(fv.version) as latest_version,
+            MAX(fv.created_at) as last_modified
+        FROM files f
+        LEFT JOIN file_versions fv ON f.id = fv.file_id
+        GROUP BY f.id, f.original_name, f.created_by, f.created_at, f.updated_at
+        ORDER BY f.updated_at DESC
+    `;
+    
+    db.all(query, (err, rows) => {
+        if (err) {
+            console.error(err);
+            return res.status(500).json({ error: '获取文件列表失败' });
+        }
+        res.json(rows);
+    });
+});
+
+// 获取特定文件的版本列表
+app.get('/api/files/:fileId/versions', (req, res) => {
+    const { fileId } = req.params;
+    
     db.all(
-        `SELECT id, filename, original_name, version, submitter, change_description, created_at
-         FROM file_versions 
-         ORDER BY original_name, version DESC`,
+        `SELECT fv.*, f.original_name
+         FROM file_versions fv
+         JOIN files f ON fv.file_id = f.id
+         WHERE fv.file_id = ?
+         ORDER BY fv.version DESC`,
+        [fileId],
         (err, rows) => {
             if (err) {
                 console.error(err);
-                return res.status(500).json({ error: '获取文件列表失败' });
+                return res.status(500).json({ error: '获取版本列表失败' });
             }
             res.json(rows);
         }
@@ -328,88 +429,130 @@ app.get('/api/files', (req, res) => {
 });
 
 // 获取特定版本的数据
-app.get('/api/files/:fileId/data', (req, res) => {
-    const { fileId } = req.params;
+app.get('/api/versions/:versionId/data', (req, res) => {
+    const { versionId } = req.params;
     const { columns } = req.query;
     
-    // 获取文件信息
+    // 获取版本信息
     db.get(
-        'SELECT * FROM file_versions WHERE id = ?',
-        [fileId],
-        (err, fileInfo) => {
+        `SELECT fv.*, f.original_name
+         FROM file_versions fv
+         JOIN files f ON fv.file_id = f.id
+         WHERE fv.id = ?`,
+        [versionId],
+        (err, versionInfo) => {
             if (err) {
                 console.error(err);
-                return res.status(500).json({ error: '获取文件信息失败' });
+                return res.status(500).json({ error: '获取版本信息失败' });
             }
             
-            if (!fileInfo) {
-                return res.status(404).json({ error: '文件不存在' });
+            if (!versionInfo) {
+                return res.status(404).json({ error: '版本不存在' });
             }
 
-            // 获取表格数据
-            let query = `
-                SELECT row_index, column_name, cell_value, cell_type, annotations
-                FROM table_data 
-                WHERE file_version_id = ?
-            `;
-            
-            if (columns) {
-                const columnList = columns.split(',').map(col => `'${col}'`).join(',');
-                query += ` AND column_name IN (${columnList})`;
-            }
-            
-            query += ' ORDER BY row_index, column_name';
-
-            db.all(query, [fileId], (err, rows) => {
-                if (err) {
-                    console.error(err);
-                    return res.status(500).json({ error: '获取数据失败' });
-                }
-
-                // 重组数据
-                const dataMap = {};
-                const headers = new Set();
-                
-                rows.forEach(row => {
-                    if (!dataMap[row.row_index]) {
-                        dataMap[row.row_index] = { _rowIndex: row.row_index };
+            // 首先获取所有列名，按照第一行的顺序排序
+            db.all(
+                `SELECT DISTINCT column_name 
+                 FROM table_data 
+                 WHERE version_id = ? AND row_index = 0
+                 ORDER BY rowid`, // 使用rowid来保持插入顺序
+                [versionId],
+                (err, headerRows) => {
+                    if (err) {
+                        console.error(err);
+                        return res.status(500).json({ error: '获取列信息失败' });
                     }
-                    
-                    // 处理Markdown内容
-                    let cellValue = row.cell_value;
-                    if (row.cell_type === 'text' && cellValue) {
-                        cellValue = renderMarkdownTable(cellValue);
-                    }
-                    
-                    dataMap[row.row_index][row.column_name] = {
-                        value: cellValue,
-                        type: row.cell_type,
-                        annotations: row.annotations ? JSON.parse(row.annotations) : null
-                    };
-                    headers.add(row.column_name);
-                });
 
-                const data = Object.values(dataMap);
-                
-                // 获取批注信息
-                db.all(
-                    'SELECT * FROM annotations WHERE file_version_id = ?',
-                    [fileId],
-                    (err, annotations) => {
-                        if (err) {
-                            console.error(err);
-                            return res.status(500).json({ error: '获取批注失败' });
+                    // 如果第一行没有数据，则获取所有列名并尝试按字母顺序排序
+                    if (headerRows.length === 0) {
+                        db.all(
+                            `SELECT DISTINCT column_name 
+                             FROM table_data 
+                             WHERE version_id = ?
+                             ORDER BY column_name`,
+                            [versionId],
+                            (err, allHeaderRows) => {
+                                if (err) {
+                                    console.error(err);
+                                    return res.status(500).json({ error: '获取列信息失败' });
+                                }
+                                processData(allHeaderRows.map(row => row.column_name));
+                            }
+                        );
+                    } else {
+                        processData(headerRows.map(row => row.column_name));
+                    }
+
+                    function processData(orderedHeaders) {
+                        // 获取表格数据
+                        let query = `
+                            SELECT row_index, column_name, cell_value, cell_type
+                            FROM table_data 
+                            WHERE version_id = ?
+                        `;
+                        
+                        if (columns) {
+                            const columnList = columns.split(',').map(col => `'${col}'`).join(',');
+                            query += ` AND column_name IN (${columnList})`;
                         }
+                        
+                        query += ' ORDER BY row_index, column_name';
 
-                        res.json({
-                            fileInfo,
-                            headers: Array.from(headers),
-                            data,
-                            annotations
+                        db.all(query, [versionId], (err, rows) => {
+                            if (err) {
+                                console.error(err);
+                                return res.status(500).json({ error: '获取数据失败' });
+                            }
+
+                            // 重组数据
+                            const dataMap = {};
+                            
+                            rows.forEach(row => {
+                                if (!dataMap[row.row_index]) {
+                                    dataMap[row.row_index] = { _rowIndex: row.row_index };
+                                }
+                                
+                                // 处理Markdown内容
+                                let cellValue = row.cell_value;
+                                if (row.cell_type === 'text' && cellValue) {
+                                    cellValue = renderMarkdownTable(cellValue);
+                                }
+                                
+                                dataMap[row.row_index][row.column_name] = {
+                                    value: cellValue,
+                                    type: row.cell_type
+                                };
+                            });
+
+                            const data = Object.values(dataMap);
+                            
+                            // 获取批注信息
+                            db.all(
+                                'SELECT * FROM annotations WHERE version_id = ?',
+                                [versionId],
+                                (err, annotations) => {
+                                    if (err) {
+                                        console.error(err);
+                                        return res.status(500).json({ error: '获取批注失败' });
+                                    }
+
+                                    // 使用有序的headers数组
+                                    const finalHeaders = columns ? 
+                                        columns.split(',').filter(col => orderedHeaders.includes(col)) : 
+                                        orderedHeaders;
+
+                                    res.json({
+                                        versionInfo,
+                                        headers: finalHeaders, // 使用有序的headers
+                                        data,
+                                        annotations
+                                    });
+                                }
+                            );
                         });
                     }
-                );
-            });
+                }
+            );
         }
     );
 });
@@ -576,71 +719,287 @@ app.get('/api/files/:fileId/export', (req, res) => {
     );
 });
 
-// 获取文件版本对比
-app.get('/api/files/compare/:fileId1/:fileId2', (req, res) => {
-    const { fileId1, fileId2 } = req.params;
-    
-    const getData = (fileId) => {
-        return new Promise((resolve, reject) => {
-            db.all(
-                `SELECT row_index, column_name, cell_value
-                 FROM table_data 
-                 WHERE file_version_id = ?
-                 ORDER BY row_index, column_name`,
-                [fileId],
-                (err, rows) => {
-                    if (err) reject(err);
-                    else resolve(rows);
-                }
-            );
-        });
-    };
 
-    Promise.all([getData(fileId1), getData(fileId2)])
-        .then(([data1, data2]) => {
-            // 比较逻辑
-            const changes = [];
-            const map1 = {};
-            const map2 = {};
+// 更新单元格数据API (使用versionId)
+app.put('/api/versions/:versionId/cell', (req, res) => {
+    const { versionId } = req.params;
+    const { rowIndex, columnName, value, cellType = 'text' } = req.body;
 
-            data1.forEach(row => {
-                const key = `${row.row_index}-${row.column_name}`;
-                map1[key] = row.cell_value;
-            });
-
-            data2.forEach(row => {
-                const key = `${row.row_index}-${row.column_name}`;
-                map2[key] = row.cell_value;
-            });
-
-            // 找出差异
-            const allKeys = new Set([...Object.keys(map1), ...Object.keys(map2)]);
+    db.run(
+        `UPDATE table_data 
+         SET cell_value = ?, cell_type = ?, updated_at = CURRENT_TIMESTAMP
+         WHERE version_id = ? AND row_index = ? AND column_name = ?`,
+        [value, cellType, versionId, rowIndex, columnName],
+        function(err) {
+            if (err) {
+                console.error(err);
+                return res.status(500).json({ error: '更新失败' });
+            }
             
-            allKeys.forEach(key => {
-                const [rowIndex, columnName] = key.split('-');
-                const value1 = map1[key];
-                const value2 = map2[key];
-                
-                if (value1 !== value2) {
-                    changes.push({
-                        rowIndex: parseInt(rowIndex),
-                        columnName,
-                        oldValue: value1 || '',
-                        newValue: value2 || '',
-                        changeType: !value1 ? 'added' : !value2 ? 'deleted' : 'modified'
+            if (this.changes === 0) {
+                return res.status(404).json({ error: '单元格不存在' });
+            }
+            
+            res.json({ success: true, message: '更新成功' });
+        }
+    );
+});
+
+// 添加自定义列API (使用versionId)
+app.post('/api/versions/:versionId/column', (req, res) => {
+    const { versionId } = req.params;
+    const { columnName, columnType = 'text' } = req.body;
+
+    const columnId = uuidv4();
+    
+    db.run(
+        `INSERT INTO custom_columns (id, version_id, column_name, column_type)
+         VALUES (?, ?, ?, ?)`,
+        [columnId, versionId, columnName, columnType],
+        function(err) {
+            if (err) {
+                console.error(err);
+                return res.status(500).json({ error: '添加列失败' });
+            }
+
+            // 为所有现有行添加新列的空数据
+            db.all(
+                'SELECT DISTINCT row_index FROM table_data WHERE version_id = ?',
+                [versionId],
+                (err, rows) => {
+                    if (err) {
+                        console.error(err);
+                        return res.status(500).json({ error: '获取行数据失败' });
+                    }
+
+                    const stmt = db.prepare(`
+                        INSERT INTO table_data (id, version_id, row_index, column_name, cell_value, cell_type)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    `);
+
+                    rows.forEach(row => {
+                        const cellId = uuidv4();
+                        stmt.run([cellId, versionId, row.row_index, columnName, '', columnType]);
+                    });
+
+                    stmt.finalize();
+
+                    res.json({ 
+                        success: true,
+                        columnId,
+                        message: '列添加成功' 
                     });
                 }
-            });
+            );
+        }
+    );
+});
 
-            res.json({ changes });
-        })
-        .catch(err => {
-            console.error(err);
-            res.status(500).json({ error: '版本对比失败' });
-        });
+
+// 保存当前版本的修改为新版本
+app.post('/api/versions/:versionId/save-new-version', (req, res) => {
+    const { versionId } = req.params;
+    const { submitter, changeDescription } = req.body;
+
+    // 首先获取当前版本信息
+    db.get(
+        `SELECT fv.*, f.id as file_id, f.original_name
+         FROM file_versions fv
+         JOIN files f ON fv.file_id = f.id
+         WHERE fv.id = ?`,
+        [versionId],
+        (err, currentVersion) => {
+            if (err) {
+                console.error(err);
+                return res.status(500).json({ error: '获取版本信息失败' });
+            }
+
+            if (!currentVersion) {
+                return res.status(404).json({ error: '版本不存在' });
+            }
+
+            // 获取该文件的最新版本号
+            db.get(
+                'SELECT MAX(version) as max_version FROM file_versions WHERE file_id = ?',
+                [currentVersion.file_id],
+                (err, row) => {
+                    if (err) {
+                        console.error(err);
+                        return res.status(500).json({ error: '获取版本信息失败' });
+                    }
+
+                    const newVersion = (row.max_version || 0) + 1;
+                    const newVersionId = uuidv4();
+
+                    // 创建新版本记录
+                    db.run(
+                        `INSERT INTO file_versions (id, file_id, version, filename, file_path, submitter, change_description, file_size, created_at)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+                        [newVersionId, currentVersion.file_id, newVersion, currentVersion.filename, currentVersion.file_path, submitter, changeDescription, currentVersion.file_size],
+                        function(err) {
+                            if (err) {
+                                console.error(err);
+                                return res.status(500).json({ error: '创建新版本失败' });
+                            }
+
+                            // 复制当前版本的所有数据到新版本
+                            db.all(
+                                'SELECT row_index, column_name, cell_value, cell_type FROM table_data WHERE version_id = ?',
+                                [versionId],
+                                (err, tableData) => {
+                                    if (err) {
+                                        console.error(err);
+                                        return res.status(500).json({ error: '获取表格数据失败' });
+                                    }
+
+                                    // 批量插入新版本的数据
+                                    const stmt = db.prepare(`
+                                        INSERT INTO table_data (id, version_id, row_index, column_name, cell_value, cell_type)
+                                        VALUES (?, ?, ?, ?, ?, ?)
+                                    `);
+
+                                    tableData.forEach(row => {
+                                        const cellId = uuidv4();
+                                        stmt.run([cellId, newVersionId, row.row_index, row.column_name, row.cell_value, row.cell_type]);
+                                    });
+
+                                    stmt.finalize();
+
+                                    // 复制批注数据
+                                    db.all(
+                                        'SELECT row_index, column_name, annotation_type, annotation_data, created_by FROM annotations WHERE version_id = ?',
+                                        [versionId],
+                                        (err, annotations) => {
+                                            if (err) {
+                                                console.error(err);
+                                                // 即使批注复制失败，也返回成功，因为主要数据已经保存
+                                            } else {
+                                                const annotationStmt = db.prepare(`
+                                                    INSERT INTO annotations (id, version_id, row_index, column_name, annotation_type, annotation_data, created_by, created_at)
+                                                    VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                                                `);
+
+                                                annotations.forEach(annotation => {
+                                                    const annotationId = uuidv4();
+                                                    annotationStmt.run([annotationId, newVersionId, annotation.row_index, annotation.column_name, annotation.annotation_type, annotation.annotation_data, annotation.created_by]);
+                                                });
+
+                                                annotationStmt.finalize();
+                                            }
+
+                                            // 更新文件的最后修改时间
+                                            db.run(
+                                                'UPDATE files SET updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+                                                [currentVersion.file_id]
+                                            );
+
+                                            res.json({
+                                                success: true,
+                                                versionId: newVersionId,
+                                                version: newVersion,
+                                                fileId: currentVersion.file_id,
+                                                message: `已保存为新版本 v${newVersion}`
+                                            });
+                                        }
+                                    );
+                                }
+                            );
+                        }
+                    );
+                }
+            );
+        }
+    );
 });
 
 // 启动服务器
 app.listen(PORT, () => {
     console.log(`服务器运行在端口 ${PORT}`);
+});
+
+
+// 版本比较API
+app.get('/api/versions/compare/:version1/:version2', (req, res) => {
+    const { version1, version2 } = req.params;
+    
+    // 获取两个版本的数据
+    const getVersionData = (versionId) => {
+        return new Promise((resolve, reject) => {
+            db.all(
+                'SELECT row_index, column_name, cell_value, cell_type FROM table_data WHERE version_id = ? ORDER BY row_index, column_name',
+                [versionId],
+                (err, rows) => {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        const dataMap = {};
+                        rows.forEach(row => {
+                            const key = `${row.row_index}-${row.column_name}`;
+                            dataMap[key] = {
+                                value: row.cell_value,
+                                type: row.cell_type,
+                                rowIndex: row.row_index,
+                                columnName: row.column_name
+                            };
+                        });
+                        resolve(dataMap);
+                    }
+                }
+            );
+        });
+    };
+    
+    Promise.all([getVersionData(version1), getVersionData(version2)])
+        .then(([data1, data2]) => {
+            const changes = [];
+            const allKeys = new Set([...Object.keys(data1), ...Object.keys(data2)]);
+            
+            allKeys.forEach(key => {
+                const cell1 = data1[key];
+                const cell2 = data2[key];
+                
+                if (!cell1 && cell2) {
+                    // 新增的单元格
+                    changes.push({
+                        rowIndex: cell2.rowIndex,
+                        columnName: cell2.columnName,
+                        changeType: 'added',
+                        oldValue: '',
+                        newValue: cell2.value,
+                        position: key
+                    });
+                } else if (cell1 && !cell2) {
+                    // 删除的单元格
+                    changes.push({
+                        rowIndex: cell1.rowIndex,
+                        columnName: cell1.columnName,
+                        changeType: 'deleted',
+                        oldValue: cell1.value,
+                        newValue: '',
+                        position: key
+                    });
+                } else if (cell1 && cell2 && cell1.value !== cell2.value) {
+                    // 修改的单元格
+                    changes.push({
+                        rowIndex: cell1.rowIndex,
+                        columnName: cell1.columnName,
+                        changeType: 'modified',
+                        oldValue: cell1.value,
+                        newValue: cell2.value,
+                        position: key
+                    });
+                }
+            });
+            
+            res.json({
+                success: true,
+                changes: changes,
+                version1,
+                version2
+            });
+        })
+        .catch(err => {
+            console.error('版本比较失败:', err);
+            res.status(500).json({ error: '版本比较失败' });
+        });
 });
