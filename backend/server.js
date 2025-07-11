@@ -450,69 +450,109 @@ app.get('/api/versions/:versionId/data', (req, res) => {
                 return res.status(404).json({ error: '版本不存在' });
             }
 
-            // 获取表格数据
-            let query = `
-                SELECT row_index, column_name, cell_value, cell_type
-                FROM table_data 
-                WHERE version_id = ?
-            `;
-            
-            if (columns) {
-                const columnList = columns.split(',').map(col => `'${col}'`).join(',');
-                query += ` AND column_name IN (${columnList})`;
-            }
-            
-            query += ' ORDER BY row_index, column_name';
-
-            db.all(query, [versionId], (err, rows) => {
-                if (err) {
-                    console.error(err);
-                    return res.status(500).json({ error: '获取数据失败' });
-                }
-
-                // 重组数据
-                const dataMap = {};
-                const headers = new Set();
-                
-                rows.forEach(row => {
-                    if (!dataMap[row.row_index]) {
-                        dataMap[row.row_index] = { _rowIndex: row.row_index };
+            // 首先获取所有列名，按照第一行的顺序排序
+            db.all(
+                `SELECT DISTINCT column_name 
+                 FROM table_data 
+                 WHERE version_id = ? AND row_index = 0
+                 ORDER BY rowid`, // 使用rowid来保持插入顺序
+                [versionId],
+                (err, headerRows) => {
+                    if (err) {
+                        console.error(err);
+                        return res.status(500).json({ error: '获取列信息失败' });
                     }
-                    
-                    // 处理Markdown内容
-                    let cellValue = row.cell_value;
-                    if (row.cell_type === 'text' && cellValue) {
-                        cellValue = renderMarkdownTable(cellValue);
-                    }
-                    
-                    dataMap[row.row_index][row.column_name] = {
-                        value: cellValue,
-                        type: row.cell_type
-                    };
-                    headers.add(row.column_name);
-                });
 
-                const data = Object.values(dataMap);
-                
-                // 获取批注信息
-                db.all(
-                    'SELECT * FROM annotations WHERE version_id = ?',
-                    [versionId],
-                    (err, annotations) => {
-                        if (err) {
-                            console.error(err);
-                            return res.status(500).json({ error: '获取批注失败' });
+                    // 如果第一行没有数据，则获取所有列名并尝试按字母顺序排序
+                    if (headerRows.length === 0) {
+                        db.all(
+                            `SELECT DISTINCT column_name 
+                             FROM table_data 
+                             WHERE version_id = ?
+                             ORDER BY column_name`,
+                            [versionId],
+                            (err, allHeaderRows) => {
+                                if (err) {
+                                    console.error(err);
+                                    return res.status(500).json({ error: '获取列信息失败' });
+                                }
+                                processData(allHeaderRows.map(row => row.column_name));
+                            }
+                        );
+                    } else {
+                        processData(headerRows.map(row => row.column_name));
+                    }
+
+                    function processData(orderedHeaders) {
+                        // 获取表格数据
+                        let query = `
+                            SELECT row_index, column_name, cell_value, cell_type
+                            FROM table_data 
+                            WHERE version_id = ?
+                        `;
+                        
+                        if (columns) {
+                            const columnList = columns.split(',').map(col => `'${col}'`).join(',');
+                            query += ` AND column_name IN (${columnList})`;
                         }
+                        
+                        query += ' ORDER BY row_index, column_name';
 
-                        res.json({
-                            versionInfo,
-                            headers: Array.from(headers),
-                            data,
-                            annotations
+                        db.all(query, [versionId], (err, rows) => {
+                            if (err) {
+                                console.error(err);
+                                return res.status(500).json({ error: '获取数据失败' });
+                            }
+
+                            // 重组数据
+                            const dataMap = {};
+                            
+                            rows.forEach(row => {
+                                if (!dataMap[row.row_index]) {
+                                    dataMap[row.row_index] = { _rowIndex: row.row_index };
+                                }
+                                
+                                // 处理Markdown内容
+                                let cellValue = row.cell_value;
+                                if (row.cell_type === 'text' && cellValue) {
+                                    cellValue = renderMarkdownTable(cellValue);
+                                }
+                                
+                                dataMap[row.row_index][row.column_name] = {
+                                    value: cellValue,
+                                    type: row.cell_type
+                                };
+                            });
+
+                            const data = Object.values(dataMap);
+                            
+                            // 获取批注信息
+                            db.all(
+                                'SELECT * FROM annotations WHERE version_id = ?',
+                                [versionId],
+                                (err, annotations) => {
+                                    if (err) {
+                                        console.error(err);
+                                        return res.status(500).json({ error: '获取批注失败' });
+                                    }
+
+                                    // 使用有序的headers数组
+                                    const finalHeaders = columns ? 
+                                        columns.split(',').filter(col => orderedHeaders.includes(col)) : 
+                                        orderedHeaders;
+
+                                    res.json({
+                                        versionInfo,
+                                        headers: finalHeaders, // 使用有序的headers
+                                        data,
+                                        annotations
+                                    });
+                                }
+                            );
                         });
                     }
-                );
-            });
+                }
+            );
         }
     );
 });
